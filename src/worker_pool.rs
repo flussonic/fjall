@@ -117,6 +117,33 @@ impl WorkerPool {
 
         Ok(())
     }
+
+    /// Tells every worker to exit and waits until the last one has left.
+    pub fn stop(&self, active_thread_counter: &AtomicUsize) {
+        stop_workers(&self.rx, &self.sender, active_thread_counter);
+    }
+}
+
+/// Offers `Close` until the active thread counter reaches zero.
+///
+/// The workers are the only readers of the channel, and each of them takes
+/// exactly one `Close` before it exits, so nothing reads the channel once the
+/// last worker has taken its message. A blocking `send` here could then never
+/// be woken up: the loop fills the channel by itself while a worker is slow
+/// to come back to `recv` (<https://github.com/fjall-rs/fjall/issues/260>).
+/// `try_send` keeps offering instead — a full channel already holds a `Close`
+/// for every worker still to come — and the queue is drained every round, so
+/// the wake-ups always have room.
+fn stop_workers(
+    rx: &flume::Receiver<WorkerMessage>,
+    sender: &flume::Sender<WorkerMessage>,
+    active_thread_counter: &AtomicUsize,
+) {
+    while active_thread_counter.load(Relaxed) > 0 {
+        let _ = rx.drain().count();
+        let _ = sender.try_send(WorkerMessage::Close);
+        std::thread::sleep(std::time::Duration::from_micros(10));
+    }
 }
 
 /// Claims one slot in the active thread counter per worker, immediately before
@@ -166,10 +193,31 @@ struct WorkerState {
     stats: Arc<Stats>,
 }
 
+/// Keeps a worker inside its current tick while a test asks for it.
+///
+/// A worker that holds a message stops reading the queue, which is the state
+/// a shutdown deadlock needs and the one a test cannot reach otherwise: real
+/// work (a flush with nothing queued, a compaction of three tiny segments)
+/// finishes faster than a single thread can refill the queue.
+#[cfg(test)]
+static HOLD_WORKERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Blocks the calling worker while [`HOLD_WORKERS`] is set.
+#[cfg(test)]
+fn hold_while_requested() {
+    while HOLD_WORKERS.load(std::sync::atomic::Ordering::Acquire) {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
 fn worker_tick(ctx: &WorkerState) -> crate::Result<bool> {
     let Ok(item) = ctx.rx.recv() else {
         return Ok(true);
     };
+
+    // Holds the message — and with it the queue — for the shutdown tests.
+    #[cfg(test)]
+    hold_while_requested();
 
     log::trace!("Worker #{} got message: {item:?}", ctx.worker_id);
 
@@ -386,5 +434,114 @@ mod tests {
 
         assert!(outcome.is_err());
         assert_eq!(counter.load(Relaxed), 0);
+    }
+
+    /// The stop loop must not wait for room in the worker channel: the
+    /// workers are the channel's only readers, each takes exactly one `Close`
+    /// before leaving, and the last one can be preempted between taking its
+    /// message and releasing its counter slot. The loop itself keeps offering
+    /// `Close` in that window, so with a blocking `send` it fills the channel
+    /// and then waits for a reader that no longer exists — the database never
+    /// closes (<https://github.com/fjall-rs/fjall/issues/260>).
+    ///
+    /// The channel starts full, and the counter releases its last slot 50ms
+    /// later — as if the last worker had been descheduled mid-exit. Nothing
+    /// ever reads the channel, so a blocking send wedges on the first offer;
+    /// `try_send` plus the per-round drain ride out the window and the stop
+    /// finishes as soon as the counter reaches zero.
+    #[test]
+    fn stop_does_not_block_on_a_full_channel() {
+        let (sender, rx) = flume::bounded::<WorkerMessage>(8);
+        let counter = Arc::new(AtomicUsize::new(1));
+
+        for _ in 0..8 {
+            let _ = sender.try_send(WorkerMessage::Flush);
+        }
+        assert!(rx.is_full());
+
+        let stopper = std::thread::spawn({
+            let counter = counter.clone();
+            move || stop_workers(&rx, &sender, &counter)
+        });
+
+        // The last worker's slot lands well after the channel filled up.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        counter.fetch_sub(1, Relaxed);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !stopper.is_finished() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "stop loop is blocked on the full worker channel",
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        stopper.join().expect("stop thread");
+    }
+
+    /// Closing a database finishes even when its only worker holds the queue
+    /// shut and lets go mid-shutdown.
+    ///
+    /// This is the hardest shutdown state a test can set up from the outside:
+    /// the worker parks inside a tick, so nothing reads the queue while the
+    /// test fills it to the brim; then the worker wakes and leaves while the
+    /// shutdown is in flight.
+    ///
+    /// It does **not** reproduce the deadlock of
+    /// <https://github.com/fjall-rs/fjall/issues/260>, and passes on the old
+    /// `while counter > 0 { sender.send(Close); sleep }` too. Reaching that
+    /// one needs the last worker to leave *without taking a message*: as long
+    /// as it exits by reading `Close`, it frees a slot, the blocking send
+    /// returns and the loop gets to see the counter at zero. A worker leaves
+    /// empty-handed only when it bails out on its own — an `Err` out of
+    /// `worker_tick`, an unwind — and neither can be arranged from a test
+    /// without reaching into the worker body. That path is covered by the
+    /// `ActiveThreadGuard` tests instead.
+    ///
+    /// So the value here is the state, not the failure: the shutdown must
+    /// never wait on the queue, and this test pins that down with a real
+    /// database whose worker is parked for the whole fill-up.
+    #[test]
+    fn dropping_a_database_finishes_when_a_worker_holds_the_queue() -> crate::Result<()> {
+        let folder = tempfile::tempdir()?;
+        let db = Database::builder(&folder).worker_threads(1).open()?;
+
+        {
+            let ks = db.keyspace("default", KeyspaceCreateOptions::default)?;
+            ks.insert("a", "a")?;
+        }
+
+        // Park the worker inside a tick, then fill the queue it no longer
+        // reads.
+        HOLD_WORKERS.store(true, std::sync::atomic::Ordering::Release);
+        let _ = db.worker_pool.sender.try_send(WorkerMessage::Flush);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        while db.worker_pool.sender.try_send(WorkerMessage::Flush).is_ok() {}
+
+        let closing = std::thread::spawn(move || drop(db));
+
+        // Let the shutdown work against the full queue, then release the
+        // worker: it takes one message and leaves.
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        HOLD_WORKERS.store(false, std::sync::atomic::Ordering::Release);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let mut timed_out = false;
+        while !closing.is_finished() {
+            if std::time::Instant::now() >= deadline {
+                timed_out = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        assert!(
+            !timed_out,
+            "closing the database did not finish in 20s: the shutdown is \
+             waiting for room in a worker queue that has no reader left",
+        );
+        assert!(closing.join().is_ok(), "closing thread panicked");
+
+        Ok(())
     }
 }
